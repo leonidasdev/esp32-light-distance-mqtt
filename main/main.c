@@ -20,6 +20,7 @@
 #include "telegram.h"
 #include "deepsleep_manager.h"
 #include "hcsr04.h"
+#include "ota_manager.h"
 #if __has_include("esp_crt_bundle.h")
 #include "esp_crt_bundle.h"
 #define HAVE_ESP_CRT_BUNDLE 1
@@ -162,6 +163,10 @@ void app_main(void)
     }
 
     init_wifi_module();
+
+    // Initialize OTA manager (uses filesystem/ota.cfg or attributes to control behavior).
+    // The internal poller will be started once MQTT is connected (see mqtt.c).
+    ota_manager_init(NULL);
 
     struct persistence_config wifi_network_config;
     if (!persistence_read_config(WIFI_CREDENTIALS_PATH, &wifi_network_config) ||

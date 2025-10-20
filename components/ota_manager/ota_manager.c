@@ -27,10 +27,54 @@ static char *read_file_to_buffer(const char *path)
 
 static const char *TAG = "ota_manager";
 
+static int s_poll_minutes = 5; // default poll interval in minutes
+
+// optional MQTT telemetry publish function (implemented in mqtt_manager)
+extern void mqtt_publish_telemetry(const char *json_payload);
+
+int ota_manager_get_poll_minutes(void) { return s_poll_minutes; }
+
 void ota_manager_init(const char *manifest_url)
 {
     ESP_LOGI(TAG, "ota_manager_init called (manifest_url=%s)", manifest_url ? manifest_url : "(none)");
     // For now we don't persist manifest_url; future work: read /filesystem/ota_config.json
+}
+
+// Poll task state
+static TaskHandle_t s_poller_task = NULL;
+
+static void ota_poller_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "OTA poller task started");
+    while (1) {
+        int minutes = ota_manager_get_poll_minutes();
+        if (minutes <= 0) minutes = 5;
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)minutes * 60u * 1000u));
+        ESP_LOGI(TAG, "OTA poller waking to check for updates (interval=%d minutes)", minutes);
+        ota_manager_check_and_update();
+    }
+}
+
+void ota_manager_start_poller(void)
+{
+    if (s_poller_task) {
+        ESP_LOGW(TAG, "OTA poller already running");
+        return;
+    }
+    BaseType_t r = xTaskCreate(ota_poller_task, "ota_poller", 4096, NULL, tskIDLE_PRIORITY + 1, &s_poller_task);
+    if (r != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ota poller task");
+        s_poller_task = NULL;
+    }
+}
+
+void ota_manager_stop_poller(void)
+{
+    if (!s_poller_task) return;
+    vTaskDelete(s_poller_task);
+    s_poller_task = NULL;
+    ESP_LOGI(TAG, "OTA poller stopped");
 }
 
 bool ota_manager_check_and_update(void)
@@ -149,7 +193,6 @@ bool ota_manager_check_and_update(void)
 void ota_manager_set_schedule(int hour, int minute)
 {
     ESP_LOGI(TAG, "Schedule set to %02d:%02d (not yet implemented)", hour, minute);
-    // TODO: spawn FreeRTOS task to wait until scheduled time and trigger checks
 }
 
 void ota_manager_enable_on_boot(bool enable)
@@ -160,5 +203,67 @@ void ota_manager_enable_on_boot(bool enable)
 void ota_manager_report_status(const char *status, const char *detail)
 {
     ESP_LOGI(TAG, "OTA status: %s - %s", status, detail ? detail : "");
-    // TODO: publish to MQTT using mqtt_publish_telemetry() when MQTT client ready
+}
+
+void ota_manager_handle_attribute_update(const char *json_payload)
+{
+    if (!json_payload) return;
+    ESP_LOGI(TAG, "ota attribute update: %s", json_payload);
+    cJSON *root = cJSON_Parse(json_payload);
+    if (!root) {
+        ESP_LOGE(TAG, "Invalid OTA attribute JSON");
+        return;
+    }
+
+    // If ota_manifest_url present, write to /filesystem/ota.cfg and trigger check
+    cJSON *murl = cJSON_GetObjectItemCaseSensitive(root, "ota_manifest_url");
+        if (cJSON_IsString(murl) && murl->valuestring) {
+        ESP_LOGI(TAG, "Received ota_manifest_url: %s", murl->valuestring);
+        // write minimal ota.cfg with manifest_url
+        FILE *f = fopen("/filesystem/ota.cfg", "w");
+        if (f) {
+            fprintf(f, "{\"manifest_url\":\"%s\",\"on_boot\":false}\n", murl->valuestring);
+            fclose(f);
+                ota_manager_report_status("check_started", murl->valuestring);
+                ota_manager_check_and_update();
+        } else {
+            ESP_LOGE(TAG, "Failed to open /filesystem/ota.cfg for writing");
+        }
+    }
+
+    // If ota_command present, treat as immediate instruction
+    cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "ota_command");
+    if (cmd && cJSON_IsObject(cmd)) {
+        cJSON *url = cJSON_GetObjectItemCaseSensitive(cmd, "url");
+        cJSON *version = cJSON_GetObjectItemCaseSensitive(cmd, "version");
+        cJSON *sha = cJSON_GetObjectItemCaseSensitive(cmd, "sha256");
+        if (cJSON_IsString(url) && url->valuestring) {
+            // create a temporary ota.cfg entry with url as direct binary
+            FILE *f = fopen("/filesystem/ota.cfg", "w");
+            if (f) {
+                fprintf(f, "{\"manifest_url\":\"%s\",\"on_boot\":false}\n", url->valuestring);
+                fclose(f);
+                ota_manager_report_status("download_requested", url->valuestring);
+                ota_manager_check_and_update();
+            } else {
+                ESP_LOGE(TAG, "Failed to open /filesystem/ota.cfg for writing (cmd)");
+            }
+        } else {
+            ESP_LOGW(TAG, "ota_command missing 'url'");
+        }
+    }
+
+    /* Optional: allow remote attribute to adjust poll interval
+       Attribute name in ThingsBoard: ota.poll_minutes (or ota_poll_minutes when delivered in JSON)
+    */
+    cJSON *poll = cJSON_GetObjectItemCaseSensitive(root, "ota_poll_minutes");
+    if (cJSON_IsNumber(poll)) {
+        int val = poll->valueint;
+        if (val > 0) {
+            s_poll_minutes = val;
+            ESP_LOGI(TAG, "Updated ota poll minutes to %d", s_poll_minutes);
+        }
+    }
+
+    cJSON_Delete(root);
 }

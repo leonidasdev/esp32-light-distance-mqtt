@@ -6,6 +6,7 @@
  * handle and exposes a small API used by the rest of the application.
  */
 #include "mqtt.h"
+#include "ota_manager.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -26,9 +27,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to broker");
+        /* subscribe to ThingsBoard attribute updates */
+        if (event->client) {
+            int sub_id = esp_mqtt_client_subscribe(event->client, "v1/devices/me/attributes", 1);
+            ESP_LOGI(TAG, "Subscribed to attributes (msg_id=%d)", sub_id);
+        }
+        // Start OTA poller now that MQTT is connected so attribute-driven OTA works
+        ota_manager_start_poller();
         break;
+    case MQTT_EVENT_DATA: {
+        // event->topic, event->topic_len, event->data, event->data_len are valid
+        char topic[event->topic_len + 1];
+        char data[event->data_len + 1];
+        memcpy(topic, event->topic, event->topic_len);
+        topic[event->topic_len] = '\0';
+        memcpy(data, event->data, event->data_len);
+        data[event->data_len] = '\0';
+        ESP_LOGI(TAG, "MQTT data on topic: %s", topic);
+        // If this is an attributes message from ThingsBoard, forward the payload
+        if (strstr(topic, "attributes") != NULL) {
+            ota_manager_handle_attribute_update(data);
+        }
+        break;
+    }
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected from broker");
+        // stop OTA poller while disconnected
+        ota_manager_stop_poller();
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "mqtt error");
