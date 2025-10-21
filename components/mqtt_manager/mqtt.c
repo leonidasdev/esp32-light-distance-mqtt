@@ -28,14 +28,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "connected to broker");
         /* subscribe to ThingsBoard attribute updates */
-        if (event->client) {
+        if (event->client)
+        {
             int sub_id = esp_mqtt_client_subscribe(event->client, "v1/devices/me/attributes", 1);
             ESP_LOGI(TAG, "Subscribed to attributes (msg_id=%d)", sub_id);
+            // subscribe to attribute responses (for explicit requests)
+            int sub_id2 = esp_mqtt_client_subscribe(event->client, "v1/devices/me/attributes/response/+", 1);
+            ESP_LOGI(TAG, "Subscribed to attribute responses (msg_id=%d)", sub_id2);
+            // Request current attributes from ThingsBoard; the response will arrive on the response topic
+            int pub_id = esp_mqtt_client_publish(event->client, "v1/devices/me/attributes/request/1", "{}", 0, 1, 0);
+            ESP_LOGI(TAG, "Requested current attributes (msg_id=%d)", pub_id);
         }
-        // Start OTA poller now that MQTT is connected so attribute-driven OTA works
-        ota_manager_start_poller();
+        // Attribute-driven OTA will be triggered when attribute responses arrive
         break;
-    case MQTT_EVENT_DATA: {
+    case MQTT_EVENT_DATA:
+    {
         // event->topic, event->topic_len, event->data, event->data_len are valid
         char topic[event->topic_len + 1];
         char data[event->data_len + 1];
@@ -45,7 +52,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         data[event->data_len] = '\0';
         ESP_LOGI(TAG, "MQTT data on topic: %s", topic);
         // If this is an attributes message from ThingsBoard, forward the payload
-        if (strstr(topic, "attributes") != NULL) {
+        if (strstr(topic, "attributes/response") != NULL || strstr(topic, "attributes") != NULL)
+        {
+            // Forward ThingsBoard attribute updates or attribute responses to ota_manager
             ota_manager_handle_attribute_update(data);
         }
         break;
@@ -53,7 +62,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected from broker");
         // stop OTA poller while disconnected
-        ota_manager_stop_poller();
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "mqtt error");
@@ -82,7 +90,8 @@ void mqtt_app_start(const char *uri, const char *access_token)
         return;
     }
 
-    if (uri == NULL || access_token == NULL) {
+    if (uri == NULL || access_token == NULL)
+    {
         ESP_LOGE(TAG, "mqtt_app_start called with NULL uri or access_token");
         return;
     }
@@ -114,7 +123,8 @@ void mqtt_app_start(const char *uri, const char *access_token)
 
 bool mqtt_app_start_from_file(const char *uri, const char *token_file_path)
 {
-    if (uri == NULL || token_file_path == NULL) return false;
+    if (uri == NULL || token_file_path == NULL)
+        return false;
 
     FILE *f = fopen(token_file_path, "r");
     if (!f)
@@ -157,7 +167,8 @@ void mqtt_publish_telemetry(const char *json_payload)
         ESP_LOGW(TAG, "cannot publish, mqtt client not started");
         return;
     }
-    if (!json_payload) {
+    if (!json_payload)
+    {
         ESP_LOGW(TAG, "mqtt_publish_telemetry called with NULL payload");
         return;
     }

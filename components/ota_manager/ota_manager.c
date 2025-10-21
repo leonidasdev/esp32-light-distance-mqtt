@@ -12,13 +12,26 @@
 static char *read_file_to_buffer(const char *path)
 {
     FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) != 0)
+    {
+        fclose(f);
+        return NULL;
+    }
     long s = ftell(f);
-    if (s < 0) { fclose(f); return NULL; }
+    if (s < 0)
+    {
+        fclose(f);
+        return NULL;
+    }
     fseek(f, 0, SEEK_SET);
     char *buf = malloc((size_t)s + 1);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf)
+    {
+        fclose(f);
+        return NULL;
+    }
     size_t r = fread(buf, 1, (size_t)s, f);
     buf[r] = '\0';
     fclose(f);
@@ -40,152 +53,75 @@ void ota_manager_init(const char *manifest_url)
     // For now we don't persist manifest_url; future work: read /filesystem/ota_config.json
 }
 
-// Poll task state
-static TaskHandle_t s_poller_task = NULL;
 
-static void ota_poller_task(void *arg)
+// FOTA (ThingsBoard only)
+// This function expects all required FOTA metadata to be passed in as a cJSON object.
+// It is called from ota_manager_handle_attribute_update().
+bool ota_manager_apply_fota_from_attributes(cJSON *root)
 {
-    (void)arg;
-    ESP_LOGI(TAG, "OTA poller task started");
-    while (1) {
-        int minutes = ota_manager_get_poll_minutes();
-        if (minutes <= 0) minutes = 5;
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)minutes * 60u * 1000u));
-        ESP_LOGI(TAG, "OTA poller waking to check for updates (interval=%d minutes)", minutes);
-        ota_manager_check_and_update();
-    }
-}
-
-void ota_manager_start_poller(void)
-{
-    if (s_poller_task) {
-        ESP_LOGW(TAG, "OTA poller already running");
-        return;
-    }
-    BaseType_t r = xTaskCreate(ota_poller_task, "ota_poller", 4096, NULL, tskIDLE_PRIORITY + 1, &s_poller_task);
-    if (r != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create ota poller task");
-        s_poller_task = NULL;
-    }
-}
-
-void ota_manager_stop_poller(void)
-{
-    if (!s_poller_task) return;
-    vTaskDelete(s_poller_task);
-    s_poller_task = NULL;
-    ESP_LOGI(TAG, "OTA poller stopped");
-}
-
-bool ota_manager_check_and_update(void)
-{
-    ESP_LOGI(TAG, "Checking for OTA updates...");
-
-    // Look for a manifest URL in /filesystem/ota_config.json or default to a hardcoded URL
-    const char *default_manifest = "https://raw.githubusercontent.com/leonidasdev/firmware-repo/main/manifest.json";
-    char *cfg = read_file_to_buffer("/filesystem/ota.cfg");
-    const char *manifest_url = default_manifest;
-    if (cfg) {
-        cJSON *json = cJSON_Parse(cfg);
-        if (json) {
-            cJSON *m = cJSON_GetObjectItemCaseSensitive(json, "manifest_url");
-            if (cJSON_IsString(m) && (m->valuestring != NULL)) {
-                manifest_url = strdup(m->valuestring);
-            }
-            cJSON_Delete(json);
-        }
-        free(cfg);
-    }
-
-    ESP_LOGI(TAG, "Fetching manifest: %s", manifest_url);
-    esp_http_client_config_t http_cfg = {
-        .url = manifest_url,
-        .method = HTTP_METHOD_GET,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) {
-        ESP_LOGE(TAG, "Failed to init http client for manifest");
+    // Required fields: fw_title, fw_version, fw_size, fw_checksum, fw_checksum_algorithm, fw_url
+    cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "fw_title");
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "fw_version");
+    cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "fw_size");
+    cJSON *checksum = cJSON_GetObjectItemCaseSensitive(root, "fw_checksum");
+    cJSON *algo = cJSON_GetObjectItemCaseSensitive(root, "fw_checksum_algorithm");
+    cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "fw_url");
+    if (!cJSON_IsString(title) || !cJSON_IsString(version) || !cJSON_IsNumber(size) ||
+        !cJSON_IsString(checksum) || !cJSON_IsString(algo) || !cJSON_IsString(url))
+    {
+        ESP_LOGE(TAG, "FOTA attribute missing required fields");
         return false;
     }
-    esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to fetch manifest: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    int content_length = esp_http_client_get_content_length(client);
-    char *body = malloc((size_t)content_length + 1);
-    if (!body) { esp_http_client_cleanup(client); return false; }
-    int read_len = esp_http_client_read_response(client, body, content_length + 1);
-    if (read_len <= 0) {
-        ESP_LOGE(TAG, "Empty manifest response");
-        free(body);
-        esp_http_client_cleanup(client);
-        return false;
-    }
-    body[read_len] = '\0';
-    esp_http_client_cleanup(client);
-
-    cJSON *manifest = cJSON_Parse(body);
-    free(body);
-    if (!manifest) {
-        ESP_LOGE(TAG, "Invalid JSON manifest");
-        return false;
-    }
-
-    cJSON *url_item = cJSON_GetObjectItemCaseSensitive(manifest, "url");
-    cJSON *ver_item = cJSON_GetObjectItemCaseSensitive(manifest, "version");
-    cJSON *sha_item = cJSON_GetObjectItemCaseSensitive(manifest, "sha256");
-    if (!cJSON_IsString(url_item) || !cJSON_IsString(ver_item)) {
-        ESP_LOGE(TAG, "Manifest missing url or version");
-        cJSON_Delete(manifest);
-        return false;
-    }
-
-    const char *remote_ver = ver_item->valuestring;
-    const char *bin_url = url_item->valuestring;
-    const char *expected_sha = cJSON_IsString(sha_item) ? sha_item->valuestring : NULL;
 
     // Compare with local last version stored in NVS
     esp_err_t nerr;
     nvs_handle_t h;
     nerr = nvs_open("ota", NVS_READWRITE, &h);
     char last_version[64] = {0};
-    if (nerr == ESP_OK) {
+    if (nerr == ESP_OK)
+    {
         size_t sz = sizeof(last_version);
         nvs_get_str(h, "version", last_version, &sz);
     }
-
-    if (last_version[0] != '\0' && strcmp(last_version, remote_ver) == 0) {
-        ESP_LOGI(TAG, "Device already at version %s; nothing to do", remote_ver);
-        if (nerr == ESP_OK) nvs_close(h);
-        cJSON_Delete(manifest);
+    if (last_version[0] != '\0' && strcmp(last_version, version->valuestring) == 0)
+    {
+        ESP_LOGI(TAG, "Device already at version %s; nothing to do", version->valuestring);
+        if (nerr == ESP_OK)
+            nvs_close(h);
         return false;
     }
 
-    ESP_LOGI(TAG, "New firmware available: %s -> %s", last_version[0] ? last_version : "(none)", remote_ver);
+    ESP_LOGI(TAG, "New firmware available: %s -> %s", last_version[0] ? last_version : "(none)", version->valuestring);
+    ota_manager_report_status("download_start", url->valuestring);
 
-    esp_http_client_config_t ota_cfg = {
-        .url = bin_url,
-        // In production provide .cert_pem or ensure CA present in esp_crt_bundle
+    // Download firmware to flash using OTA API
+    esp_http_client_config_t ota_http_cfg = {
+        .url = url->valuestring,
+        .use_global_ca_store = true,
     };
-
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &ota_http_cfg,
+    };
     esp_err_t ret = esp_https_ota(&ota_cfg);
-    if (ret == ESP_OK) {
+    if (ret == ESP_OK)
+    {
         ESP_LOGI(TAG, "OTA applied successfully, saving version and restarting");
-        if (nerr == ESP_OK) {
-            nvs_set_str(h, "version", remote_ver);
+        if (nerr == ESP_OK)
+        {
+            nvs_set_str(h, "version", version->valuestring);
             nvs_commit(h);
             nvs_close(h);
         }
-        cJSON_Delete(manifest);
-        // Restart to boot into the newly flashed partition
+        ota_manager_report_status("update_success", version->valuestring);
         esp_restart();
         return true; // usually not reached
-    } else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(ret));
-        if (nerr == ESP_OK) nvs_close(h);
-        cJSON_Delete(manifest);
+        if (nerr == ESP_OK)
+            nvs_close(h);
+        ota_manager_report_status("update_failed", esp_err_to_name(ret));
         return false;
     }
 }
@@ -207,63 +143,26 @@ void ota_manager_report_status(const char *status, const char *detail)
 
 void ota_manager_handle_attribute_update(const char *json_payload)
 {
-    if (!json_payload) return;
+    if (!json_payload)
+        return;
     ESP_LOGI(TAG, "ota attribute update: %s", json_payload);
     cJSON *root = cJSON_Parse(json_payload);
-    if (!root) {
+    if (!root)
+    {
         ESP_LOGE(TAG, "Invalid OTA attribute JSON");
         return;
     }
 
-    // If ota_manifest_url present, write to /filesystem/ota.cfg and trigger check
-    cJSON *murl = cJSON_GetObjectItemCaseSensitive(root, "ota_manifest_url");
-        if (cJSON_IsString(murl) && murl->valuestring) {
-        ESP_LOGI(TAG, "Received ota_manifest_url: %s", murl->valuestring);
-        // write minimal ota.cfg with manifest_url
-        FILE *f = fopen("/filesystem/ota.cfg", "w");
-        if (f) {
-            fprintf(f, "{\"manifest_url\":\"%s\",\"on_boot\":false}\n", murl->valuestring);
-            fclose(f);
-                ota_manager_report_status("check_started", murl->valuestring);
-                ota_manager_check_and_update();
-        } else {
-            ESP_LOGE(TAG, "Failed to open /filesystem/ota.cfg for writing");
-        }
+    // If all required FOTA fields are present, trigger OTA
+    if (cJSON_HasObjectItem(root, "fw_title") && cJSON_HasObjectItem(root, "fw_version") &&
+        cJSON_HasObjectItem(root, "fw_size") && cJSON_HasObjectItem(root, "fw_checksum") &&
+        cJSON_HasObjectItem(root, "fw_checksum_algorithm") && cJSON_HasObjectItem(root, "fw_url"))
+    {
+        ota_manager_apply_fota_from_attributes(root);
     }
-
-    // If ota_command present, treat as immediate instruction
-    cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "ota_command");
-    if (cmd && cJSON_IsObject(cmd)) {
-        cJSON *url = cJSON_GetObjectItemCaseSensitive(cmd, "url");
-        cJSON *version = cJSON_GetObjectItemCaseSensitive(cmd, "version");
-        cJSON *sha = cJSON_GetObjectItemCaseSensitive(cmd, "sha256");
-        if (cJSON_IsString(url) && url->valuestring) {
-            // create a temporary ota.cfg entry with url as direct binary
-            FILE *f = fopen("/filesystem/ota.cfg", "w");
-            if (f) {
-                fprintf(f, "{\"manifest_url\":\"%s\",\"on_boot\":false}\n", url->valuestring);
-                fclose(f);
-                ota_manager_report_status("download_requested", url->valuestring);
-                ota_manager_check_and_update();
-            } else {
-                ESP_LOGE(TAG, "Failed to open /filesystem/ota.cfg for writing (cmd)");
-            }
-        } else {
-            ESP_LOGW(TAG, "ota_command missing 'url'");
-        }
+    else
+    {
+        ESP_LOGW(TAG, "OTA attribute update missing required FOTA fields; ignoring");
     }
-
-    /* Optional: allow remote attribute to adjust poll interval
-       Attribute name in ThingsBoard: ota.poll_minutes (or ota_poll_minutes when delivered in JSON)
-    */
-    cJSON *poll = cJSON_GetObjectItemCaseSensitive(root, "ota_poll_minutes");
-    if (cJSON_IsNumber(poll)) {
-        int val = poll->valueint;
-        if (val > 0) {
-            s_poll_minutes = val;
-            ESP_LOGI(TAG, "Updated ota poll minutes to %d", s_poll_minutes);
-        }
-    }
-
     cJSON_Delete(root);
 }

@@ -164,9 +164,18 @@ void app_main(void)
 
     init_wifi_module();
 
-    // Initialize OTA manager (uses filesystem/ota.cfg or attributes to control behavior).
-    // The internal poller will be started once MQTT is connected (see mqtt.c).
-    ota_manager_init(NULL);
+    // OTA manager is attribute-driven; OTA initialization is handled when
+    // MQTT is connected and attributes are retrieved.
+
+    // Log partition table layout for OTA debugging
+    ESP_LOGI(TAG, "Partition table layout (4MB flash):");
+    ESP_LOGI(TAG, "  nvs      @ 0x9000   size 0x6000");
+    ESP_LOGI(TAG, "  phy_init @ 0xf000   size 0x1000");
+    ESP_LOGI(TAG, "  otadata  @ 0x10000  size 0x2000");
+    ESP_LOGI(TAG, "  factory  @ 0x12000  size 0x100000");
+    ESP_LOGI(TAG, "  ota_0    @ 0x112000 size 0x100000");
+    ESP_LOGI(TAG, "  ota_1    @ 0x212000 size 0x100000");
+    ESP_LOGI(TAG, "  storage  @ 0x312000 size 0xEE000");
 
     struct persistence_config wifi_network_config;
     if (!persistence_read_config(WIFI_CREDENTIALS_PATH, &wifi_network_config) ||
