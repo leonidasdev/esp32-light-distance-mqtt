@@ -152,13 +152,32 @@ void ota_manager_handle_attribute_update(const char *json_payload)
         ESP_LOGE(TAG, "Invalid OTA attribute JSON");
         return;
     }
+    // ThingsBoard attribute responses can be shaped several ways:
+    //  - plain attributes object: {"fw_version":...}
+    //  - wrapped response: {"clientToken":"..","data":{...}}
+    //  - shared attributes: {"shared":{...}}
+    // Prefer 'data' if present, then 'shared', otherwise use the root object.
+    cJSON *payload = root;
+    cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    if (cJSON_IsObject(data)) {
+        payload = data;
+        ESP_LOGI(TAG, "Using 'data' object as payload for OTA attributes");
+    } else {
+        cJSON *shared = cJSON_GetObjectItemCaseSensitive(root, "shared");
+        if (cJSON_IsObject(shared)) {
+            payload = shared;
+            ESP_LOGI(TAG, "Using 'shared' object as payload for OTA attributes");
+        } else {
+            ESP_LOGI(TAG, "Using top-level object as payload for OTA attributes");
+        }
+    }
 
-    // If all required FOTA fields are present, trigger OTA
-    if (cJSON_HasObjectItem(root, "fw_title") && cJSON_HasObjectItem(root, "fw_version") &&
-        cJSON_HasObjectItem(root, "fw_size") && cJSON_HasObjectItem(root, "fw_checksum") &&
-        cJSON_HasObjectItem(root, "fw_checksum_algorithm") && cJSON_HasObjectItem(root, "fw_url"))
+    // If all required FOTA fields are present in the payload, trigger OTA
+    if (cJSON_HasObjectItem(payload, "fw_title") && cJSON_HasObjectItem(payload, "fw_version") &&
+        cJSON_HasObjectItem(payload, "fw_size") && cJSON_HasObjectItem(payload, "fw_checksum") &&
+        cJSON_HasObjectItem(payload, "fw_checksum_algorithm") && cJSON_HasObjectItem(payload, "fw_url"))
     {
-        ota_manager_apply_fota_from_attributes(root);
+        ota_manager_apply_fota_from_attributes(payload);
     }
     else
     {
