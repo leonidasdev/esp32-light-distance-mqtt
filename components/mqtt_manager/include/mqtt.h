@@ -32,6 +32,12 @@ void mqtt_app_stop(void);
 /** Publish a telemetry JSON payload to ThingsBoard v1/devices/me/telemetry. */
 void mqtt_publish_telemetry(const char *json_payload);
 
+/** Publish client attributes JSON to ThingsBoard v1/devices/me/attributes. */
+void mqtt_publish_attributes(const char *json_payload);
+
+/** Return the access token used to start the MQTT client (not NULL once started). */
+const char *mqtt_get_access_token(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,10 +15,15 @@
 #include "mqtt_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_app_format.h"
 
 static const char *TAG = "mqtt";
 
 static esp_mqtt_client_handle_t client = NULL;
+// Stored access token (owned by mqtt manager). Allocated when mqtt_app_start_from_file
+static char *g_access_token = NULL;
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -38,6 +43,58 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             // Request current attributes from ThingsBoard; the response will arrive on the response topic
             int pub_id = esp_mqtt_client_publish(event->client, "v1/devices/me/attributes/request/1", "{}", 0, 1, 0);
             ESP_LOGI(TAG, "Requested current attributes (msg_id=%d)", pub_id);
+
+            // Publish our current firmware identity as client attributes so ThingsBoard
+            // can include it in shared attribute queries. Read last applied version/title
+            // from NVS (namespace "ota"). If not present, try to read the build app
+            // description if available.
+            char fw_version[64] = {0};
+            char fw_title[64] = {0};
+            nvs_handle_t nh;
+            esp_err_t nerr = nvs_open("ota", NVS_READONLY, &nh);
+            if (nerr == ESP_OK) {
+                size_t vsz = sizeof(fw_version);
+                size_t tsz = sizeof(fw_title);
+                nvs_get_str(nh, "version", fw_version, &vsz);
+                nvs_get_str(nh, "title", fw_title, &tsz);
+                nvs_close(nh);
+            }
+            // If we have at least one field, publish both (empty fields omitted by TB)
+            if (fw_version[0] != '\0' || fw_title[0] != '\0') {
+                char attr_payload[256];
+                if (fw_title[0] != '\0' && fw_version[0] != '\0') {
+                    snprintf(attr_payload, sizeof(attr_payload), "{\"current_fw_title\":\"%s\",\"current_fw_version\":\"%s\"}", fw_title, fw_version);
+                } else if (fw_version[0] != '\0') {
+                    snprintf(attr_payload, sizeof(attr_payload), "{\"current_fw_version\":\"%s\"}", fw_version);
+                } else {
+                    snprintf(attr_payload, sizeof(attr_payload), "{\"current_fw_title\":\"%s\"}", fw_title);
+                }
+                mqtt_publish_attributes(attr_payload);
+            }
+
+            // If we have a persisted version and haven't confirmed it yet, send a
+            // one-time confirmation telemetry so ThingsBoard knows the device
+            // successfully booted the new image. Use NVS key 'confirmed' to
+            // avoid repeating confirmations after subsequent reboots.
+            if (fw_version[0] != '\0') {
+                nvs_handle_t nh2;
+                if (nvs_open("ota", NVS_READWRITE, &nh2) == ESP_OK) {
+                    int32_t confirmed = 0;
+                    size_t sz = sizeof(confirmed);
+                    if (nvs_get_i32(nh2, "confirmed", &confirmed) != ESP_OK || confirmed == 0) {
+                        // send confirmation telemetry
+                        char confirm_payload[128];
+                        snprintf(confirm_payload, sizeof(confirm_payload), "{\"fw_state\":\"UPDATED\",\"current_fw_version\":\"%s\"}", fw_version);
+                        mqtt_publish_telemetry(confirm_payload);
+                        // mark confirmed
+                        confirmed = 1;
+                        nvs_set_i32(nh2, "confirmed", confirmed);
+                        nvs_commit(nh2);
+                        ESP_LOGI(TAG, "Published OTA confirmation telemetry for version=%s", fw_version);
+                    }
+                    nvs_close(nh2);
+                }
+            }
         }
         // Attribute-driven OTA will be triggered when attribute responses arrive
         break;
@@ -156,8 +213,16 @@ bool mqtt_app_start_from_file(const char *uri, const char *token_file_path)
         return false;
     }
 
+    // store a copy of token for other modules
+    if (g_access_token) free(g_access_token);
+    g_access_token = strdup(token);
     mqtt_app_start(uri, token);
     return true;
+}
+
+const char *mqtt_get_access_token(void)
+{
+    return g_access_token;
 }
 
 void mqtt_publish_telemetry(const char *json_payload)
@@ -176,4 +241,21 @@ void mqtt_publish_telemetry(const char *json_payload)
     const char *topic = "v1/devices/me/telemetry";
     int msg_id = esp_mqtt_client_publish(client, topic, json_payload, 0, 1, 0);
     ESP_LOGI(TAG, "published telemetry (msg_id=%d): %s", msg_id, json_payload);
+}
+
+void mqtt_publish_attributes(const char *json_payload)
+{
+    if (!client)
+    {
+        ESP_LOGW(TAG, "cannot publish attributes, mqtt client not started");
+        return;
+    }
+    if (!json_payload)
+    {
+        ESP_LOGW(TAG, "mqtt_publish_attributes called with NULL payload");
+        return;
+    }
+    const char *topic = "v1/devices/me/attributes";
+    int msg_id = esp_mqtt_client_publish(client, topic, json_payload, 0, 1, 0);
+    ESP_LOGI(TAG, "published attributes (msg_id=%d): %s", msg_id, json_payload);
 }
